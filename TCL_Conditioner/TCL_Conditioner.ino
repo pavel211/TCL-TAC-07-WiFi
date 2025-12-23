@@ -6,26 +6,17 @@
 #include "TCL.h"
 #include "EEPROM.h"
 
+#include "wifi_config.h"
+
 /////////////////////////////////////////
 // EDIT HERE
 /////////////////////////////////////////
-
-// Main
-const char* ssid        = "";
-const char* password    = "";
-const char* mqtt_server = "";
-String      main_topic  = "tcl_conditioner";
-
-// IP address
-IPAddress ip(192,168,1,10);
-IPAddress gateway(192,168,1,1);
-IPAddress subnet(255,255,255,0);
 
 // OTA
 #define OTAUSER         "admin"    // Логин для входа в OTA
 #define OTAPASSWORD     "admin"    // Пароль для входа в ОТА
 
-const char* name_device = "Кондиционер TCL";
+#define WIFI_HOSTNAME   "tcl_conditioner"
 
 /////////////////////////////////////////
 
@@ -33,6 +24,8 @@ ESP8266WebServer HttpServer(80);
 ESP8266HTTPUpdateServer httpUpdater;
 WiFiClient espClient;
 PubSubClient MQTT(espClient);
+
+String main_topic;
 
 unsigned long CounterSend_current_temperature = 0;
 
@@ -65,11 +58,12 @@ unsigned long CounterSend_current_temperature = 0;
 
         Serial.begin(9600, SERIAL_8E1); // Настраиваем UART
 
-        WiFi.mode(WIFI_STA);  
-        WiFi.begin(ssid, password); 
-        WiFi.config(ip, gateway, subnet);
+        WiFi.mode(WIFI_STA);
+        WiFi.hostname(WIFI_HOSTNAME);
+        WiFiConfig_begin(HttpServer);
+        main_topic = String(MQTT_topic()); // Задаем базовый топик
 
-        MQTT.setServer(mqtt_server, 1883);
+        MQTT.setServer(MQTT_host(), 1883);
         MQTT.setCallback(MQTT_new_message);
 
         httpUpdater.setup(&HttpServer, "/firmware", OTAUSER, OTAPASSWORD);
@@ -82,10 +76,13 @@ unsigned long CounterSend_current_temperature = 0;
 
     void loop()
     {
+      // Обрабатываем автоперезагрузку
+      WiFiConfig_loop();
+      
       // Прослушивание HTTP-запросов от клиентов
       HttpServer.handleClient();
 
-      if (millis()-lastSecUpdate > 99) // MQTT - 100 ms
+      if ((millis()-lastSecUpdate > 99) and (!GetApMode())) // MQTT - 100 ms при выключенной AP
        {
          MQTTlastUpdate = millis();
          // Обработка MQTT
@@ -126,7 +123,15 @@ unsigned long CounterSend_current_temperature = 0;
            if (conditioner.real_ac_power           != value_archive[11]){ 
               value_archive[11] = conditioner.real_ac_power;           MQTT.publish((main_topic+"/real_ac_power").c_str(),String(value_archive[11]).c_str(),true); }
 
-         } else { if (MQTT.connect(WiFi.macAddress().c_str())) { MQTT.subscribe((main_topic+"/#").c_str()); } } // Если коннекта нет - переподключаемся
+         } else {  // Если коннекта нет - переподключаемся
+            main_topic = String(MQTT_topic()); // Задаем базовый топик
+
+            if (MQTT.connect(
+               WiFi.macAddress().c_str(),
+               MQTT_user(),
+               MQTT_pass()
+            )) { MQTT.subscribe((main_topic+"/#").c_str()); }
+         }
        }
      
       // Получаем данные от кондиционера
@@ -178,13 +183,15 @@ unsigned long CounterSend_current_temperature = 0;
 
 /* Выводить надпись, если такой страницы ненайдено */
 void handleNotFound() {
-  HttpServer.send(404, "text/plain", "404: Not found - Conditioner_spalnja_2");
+  HttpServer.send(404, "text/plain", "404: Not found");
 }
 
 String WWW_setup()
 {
     return header("Setup") +  
-    "<form action='/firmware'><input type=submit value=\"UPDATE Firmware\"></form>" +
+    "<form action='/wifi'><input type=submit value=\"WiFi\"></form>" +
+    "<form action='/mqtt'><input type=submit value=\"MQTT\"></form>" +
+    "<br><form action='/firmware'><input type=submit value=\"UPDATE Firmware\"></form>" +
     "</center>" +
     "<hr><left><form action='/'><input type=submit value=\"<< Back to main page\"></form></left>" + footer();
 }
@@ -238,7 +245,7 @@ String WWW_MainPage()
     "<table border=0>"+
     "<tr><td colspan=2><h3>Основные параметры (задаются по MQTT):</h3></td></tr>" +
 
-    "<tr><td>Температура в помещении: </td><td> <b> " + String(conditioner.real_current_temperature) + " *C</b></td></tr>" +
+    "<tr><td>Температура в помещении: </td><td> <b> " + String(conditioner.real_current_temperature) + " °C</b></td></tr>" +
 
     WWW_view_bool_real (conditioner.ac_power, conditioner.real_ac_power, "Питание", "ac_power", false) +
     WWW_view_target_temperature(conditioner.target_temperature,conditioner.real_target_temperature) + 
@@ -258,33 +265,13 @@ String WWW_MainPage()
    
     "</table>"+
 
-    "<div><b>Normal receive date: " + String(conditioner.normal_receive_date) + "</b></div>"+
-    //"<div><b>RAW date: --" + CondGetRAW1 + "--</b></div>"+
+    "<div><b>Connected to AC: " + String(conditioner.normal_receive_date) + "</b></div>"+
+    //"<div><b>RAW data: --" + CondGetRAW1 + "--</b></div>"+
+
+    "<div><b>Connected to MQTT: " + MQTT.connected() + "</b></div>"+
     "<div><b>Work time: "     + String(int(millis()/1000/60/60/24)) + " days "+ String(int(millis()/1000/60/60%24)) + " hours " + String(int(millis()/1000/60%60))+ " min</b></div>" +
 
     "<form action='/setup'><input type=submit value=\"Setup\"></form>" +
-    //"<form action='/reboot'><input type=submit value=\"Reboot\" style='background-color: #d43535;'></form>" +
+    "<form action='/reboot'><input type=submit value=\"Reboot\" style='background-color: #d43535;'></form>" +
     "</center>" + footer();
 }
-
-String footer() { return "</div><div class=q><left><a>&#169; RU4PAA, 2024</a></left></div>"; }
-String header(String t) {
-  String CSS = "article { background: #f2f2f2; padding: 1.3em; }" 
-    "body { color: #eaeaea; background-color: #252525; font-family: Century Gothic, sans-serif; font-size: 18px; line-height: 24px; margin: 0; padding: 0; }"
-    "div { padding: 0.5em; }"
-    "h1 { margin: 0.5em 0 0 0; padding: 0.5em; }"
-    "input { color: #faffff; background-color: #1fa3ec; line-height: 1.5em; border-radius: 0.5em; width: 335px; padding: 5px 10px; margin: 8px 0; box-sizing: border-box; border: 1px solid #555555; font-size: 21px; font-weight: bold; }"
-    "label { color: #333; display: block; font-style: italic; font-weight: bold; }"
-    "select{ color: #faffff; background-color: #1fa3ec; line-height: 1.5em; border-radius: 0.5em; width: 335px; padding: 5px 10px; margin: 8px 0; box-sizing: border-box; border: 1px solid #555555; font-size: 21px; font-weight: bold; }"
-    "nav { background: #0066ff; color: #fff; display: block; font-size: 1.3em; padding: 1em; }"
-    "nav b { display: block; font-size: 1.5em; margin-bottom: 0.5em; } "
-    "textarea { width: 100%; }";
-    
-  String h = "<!DOCTYPE html><html>";
-    h = h + "<head><title>"+name_device+"</title><meta http-equiv='refresh' content='150'><meta http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\" />";
-    h = h + "<meta name=viewport content=\"width=device-width,initial-scale=1\">";
-    h = h + "<style>"+CSS+"</style></head>";
-    h = h + "<body><nav>"+name_device+"</nav><div>";   
-    if (t != "") h = h + "<h1>"+t+"</h1>";    
-    h = h + "</div><div><center>";
-  return h; }
